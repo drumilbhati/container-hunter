@@ -1,6 +1,6 @@
 # Container Hunter
 
-Container Hunter is a read-only tool for Linux servers that finds leftover container files and mounts (orphaned resources). 
+Container Hunter is a read-only tool for Linux servers that finds leftover container files and mounts. 
 
 When container runtimes like `containerd` crash, experience sudden server reboots, or encounter mount errors, they can leave behind hidden files, folders, and active mounts that eat up disk space. Container Hunter compares what `containerd` *thinks* is running against what is *actually* on your Linux filesystem to find, categorize, and report these resource leaks with clear evidence.
 
