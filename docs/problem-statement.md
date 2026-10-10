@@ -1,82 +1,84 @@
-# Problem Statement: Container Resource Inconsistencies and Leaks
+# Problem Statement: Leftover Container Resources and Filesystem Leaks
 
-## 1. Context and Problem Definition
+## 1. Background and Problem Overview
 
-Container runtimes on modern Linux systems manage multi-layered abstractions to provide isolated execution environments. Runtimes such as `containerd` coordinate higher-level metadata (containers, tasks, image manifests, content stores, snapshotter keys) with lower-level host primitives (OverlayFS mounts, block storage directories, network namespaces, and cgroups).
+Modern container engines on Linux (like `containerd`) coordinate two main things to run containers:
+1. **Internal tracking data** (database records of images, containers, active locks, and snapshots).
+2. **Actual system resources** (folders on disk, OverlayFS file mounts, network setups, and process limits).
 
-During normal container lifecycles, resource allocations follow strict transactional workflows:
-1. An image layer is unpacked into a snapshotter directory.
-2. An active container snapshot (upper/work directory) is prepared.
-3. OverlayFS mounts are established in host mount namespaces.
-4. Processes are spawned within target namespaces.
-5. Upon container removal, processes are terminated, OverlayFS targets are unmounted, snapshot directories are deleted, and metadata records are removed.
+When a container runs normally, everything happens in order:
+1. Container image layers are unpacked into snapshot folders.
+2. A working folder is created for the active container.
+3. Linux mounts the layers together using OverlayFS.
+4. Container processes start inside isolated namespaces.
+5. When the container stops and gets deleted, processes stop, mounts are removed, snapshot folders are deleted, and internal database entries are cleaned up.
 
-However, container lifecycle routines are vulnerable to abrupt failure modes, including daemon crashes (e.g., `SIGKILL` or panic during `containerd`), kernel panics, abrupt host restarts, out-of-memory (OOM) kills of runtime helpers, and host mount lock contention. When an operation is interrupted between host state mutation and metadata commit (or vice versa), state drift occurs.
-
----
-
-## 2. Why Runtime Metadata Alone Is Insufficient
-
-Container runtimes treat their internal database (e.g., `meta.db` in BoltDB for `containerd`) as their primary source of truth. Diagnostic tools (`ctr`, `crictl`, `nerdctl`, or Docker CLI) query this metadata layer over gRPC APIs to report active containers, images, and disk usage.
-
-This architectural decoupling introduces a fundamental blind spot:
-
-- **Unlinked Host Artifacts:** If `containerd` deletes a metadata entry for a snapshot but is terminated before `rmdir` removes `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<ID>`, the metadata store reports zero resources, while gigabytes of data remain on the host disk.
-- **Orphaned Mounts:** If an unmount operation (`umount`) fails or is interrupted, the kernel mount table (`/proc/self/mountinfo`) retains the OverlayFS mount point. Standard garbage collection routines relying on API queries will skip host mount table inspection, leaving mounts dangling indefinitely.
-- **Lost Lease Pointers:** Metadata corruption or aborted container creation can leave anonymous snapshots on disk with missing parent or lease records, rendering them invisible to standard `containerd garbage collection` routines.
-
-Therefore, relying exclusively on runtime API metadata is insufficient for detecting host-level resource exhaustion.
+However, things don't always go smoothly. Container engines can crash unexpectedly, servers can reboot mid-cleanup, out-of-memory errors can kill helper programs, or file mounts can get stuck. When these interruptions happen midway through cleanup, the internal database and the actual files on disk get out of sync.
 
 ---
 
-## 3. Resource Lifecycle Taxonomy
+## 2. Why Built-In Container Tools Miss Leftover Files
 
-To prevent imprecise claims, Container Hunter establishes a three-tier taxonomy for host-level resource anomalies:
+Container tools rely on their internal database (like `meta.db` in `containerd`) as their single source of truth. Commands like `ctr`, `crictl`, or `nerdctl` ask this database what containers and images exist.
 
-| Term | Definition | Diagnostic Characteristics |
+This design creates a major blind spot:
+
+- **Uncleaned Disk Folders:** If `containerd` deletes a database entry but gets killed before it actually deletes the folder on disk (`/var/lib/containerd/...`), the tool reports zero used space while gigabytes of leftover files sit on your server.
+- **Leftover Mounts:** If an unmount operation (`umount`) fails or gets interrupted, the Linux kernel still keeps the mount active in `/proc/self/mountinfo`. Built-in cleanup commands don't check Linux mount tables, so these mounts stay active indefinitely.
+- **Lost Ownership Links:** Aborted container setups or database glitches can leave snapshot folders on disk without any parent link or lease, making them completely invisible to standard cleanup routines.
+
+Because of this, relying only on container CLI tools or API queries isn't enough to catch hidden disk leaks.
+
+---
+
+## 3. How We Categorize Anomlies (Resource Taxonomy)
+
+To avoid false alarms, Container Hunter categorizes disk and mount issues into three clear levels:
+
+| Status Term | Simple Definition | What We Check |
 | :--- | :--- | :--- |
-| **Suspected Orphan** | A host resource (directory or mount) that lacks a direct reference in the current active runtime metadata query. | Requires further validation to ensure it is not part of a concurrent, in-flight container lifecycle or held by an active lease. |
-| **Confirmed Inconsistency** | A structural discrepancy verified between runtime metadata and host kernel/filesystem observations across multiple correlation checks. | A host snapshot directory exists whose recorded key is absent from metadata, or a metadata key points to a non-existent host path. |
-| **Proven Resource Leak** | A confirmed inconsistency that is demonstrably unreferenced by any active task, image layer, or process, and cannot be reclaimed by standard runtime garbage collection. | An unreferenced snapshot directory or dangling mount with no active process attachments, no lease locks, and age exceeding execution thresholds. |
+| **Suspected Orphan** | A folder or mount on disk that isn't listed in the container runtime's active metadata. | Needs a second check to make sure it isn't part of a container that is currently being created or deleted. |
+| **Confirmed Inconsistency** | A verified mismatch between runtime metadata and actual filesystem or mount table observations. | For example: a snapshot folder exists on disk but its ID isn't in `containerd`, or `containerd` lists a key whose folder is missing. |
+| **Proven Resource Leak** | A confirmed mismatch that is clearly unused by any running process or image, and cannot be cleaned up by normal runtime tools. | A leftover folder or dangling mount with no active processes, no lock leases, and an age that exceeds our safety threshold. |
 
 ---
 
-## 4. Primary Research Question
+## 4. Main Goal
 
-> **How accurately and efficiently can cross-layer state reconciliation detect orphaned container resources following lifecycle failures, without misclassifying legitimately retained or shared resources?**
-
----
-
-## 5. Explicit Assumptions and Constraints
-
-1. **Host Environment:** Linux operating system with kernel version 5.x or 6.x.
-2. **Container Runtime Target:** `containerd` (v1.6+) utilizing the default `overlayfs` snapshotter plugin.
-3. **Privilege Boundary:** Execution requires elevated privileges (`root` or `CAP_SYS_ADMIN` / `CAP_DAC_OVERRIDE`) to access `/proc/mountinfo` across host process namespaces and inspect `/var/lib/containerd`.
-4. **Read-Only Invariant:** Analysis must occur without mutating host filesystems, sending signal kills, or invoking runtime delete APIs.
-5. **Single-Node Scope:** State reconciliation is performed locally on a single Linux host node.
+> **Can we reliably and efficiently detect leftover container files and mounts by cross-checking Linux system state against container metadata, without accidentally flagging files that are still legitimately in use?**
 
 ---
 
-## 6. Scope Boundaries
+## 5. System Assumptions and Limits
+
+1. **Operating System:** Linux with kernel 5.x or 6.x.
+2. **Container Engine:** `containerd` (v1.6+) using the standard `overlayfs` snapshot plugin.
+3. **Required Permissions:** Root or system admin privileges (`CAP_SYS_ADMIN` / `CAP_DAC_OVERRIDE`) to read `/proc/mountinfo` and check `/var/lib/containerd`.
+4. **Safety Rule:** Operates strictly in **read-only** mode. It never deletes files, kills processes, or modifies system settings.
+5. **Single Server Scope:** Checks one Linux server at a time.
+
+---
+
+## 6. What Is Included (and What Is Not)
 
 ### In Scope
-- Reconciliation between `containerd` metadata (API/BoltDB) and host snapshot directories (`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs`).
-- Parsing and correlation of Linux mount tables (`/proc/self/mountinfo` and `/proc/*/mountinfo`).
-- Disk space impact estimation for confirmed leaks.
-- Classification of findings with explicit evidence chains.
+- Comparing `containerd` metadata with snapshot folders on disk (`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs`).
+- Reading and checking Linux mount tables (`/proc/self/mountinfo` and `/proc/*/mountinfo`).
+- Estimating total wasted disk space from leftover files.
+- Reporting findings clearly with supporting evidence.
 
 ### Out of Scope
-- Automated remediation, resource deletion, or unmounting.
-- Kubernetes CRI cluster-level reconciliation (e.g., Kubelet state vs APIServer state).
-- Multi-node distributed state inspection.
-- Non-containerd runtimes (Docker Engine/dockerd, CRI-O, Podman) in the initial MVP phase.
-- Network namespace, veth pair, or iptables rule leak detection.
+- Automatic file deletion or unmounting.
+- Kubernetes cluster-level checks (like Kubelet vs API server).
+- Multi-server network scanning.
+- Other container engines (Docker Engine, CRI-O, Podman) for the initial version.
+- Leaked network interfaces or firewall rules.
 
 ---
 
-## 7. Intended Outcome
+## 7. Expected Outcome
 
-The outcome of this project is a defensible forensic framework, open research data, and a read-only Go diagnostic tool that demonstrates whether cross-layer state correlation can reliably detect hidden container resource leaks on Linux host systems.
+A safe, read-only Go tool and clear diagnostic framework that proves whether cross-referencing system mounts and disk folders can reliably uncover hidden container leaks on Linux servers.
 
 ---
 
@@ -84,3 +86,4 @@ The outcome of this project is a defensible forensic framework, open research da
 
 - [README](../README.md)
 - [Scope and Requirements](scope-and-requirements.md)
+
