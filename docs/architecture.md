@@ -8,39 +8,52 @@ Container Hunter is compiled as a **single, lightweight Go binary** running enti
 
 ```mermaid
 flowchart TD
-    subgraph App["Container Hunter (Single In-Process Go Binary)"]
+    %% Styling Classes
+    classDef client fill:#1f6feb,stroke:#58a6ff,stroke-width:2px,color:#ffffff;
+    classDef orch fill:#8957e5,stroke:#bc8cff,stroke-width:2px,color:#ffffff;
+    classDef checker fill:#238636,stroke:#3fb950,stroke-width:2px,color:#ffffff;
+    classDef target fill:#d29922,stroke:#f0883e,stroke-width:2px,color:#000000;
+
+    subgraph App["Container Hunter (Single In-Process Binary)"]
         subgraph Presentation["Presentation"]
-            TUI["TUI Client\n(Interactive Terminal UI)"]
+            TUI["TUI Client\n(Interactive Terminal UI)"]:::client
         end
 
         subgraph Orchestration["Orchestration"]
-            HS["HunterService\n(Dispatcher & Reconciliation Engine)"]
+            HS["HunterService\n(Dispatcher & Reconciliation Engine)"]:::orch
         end
 
         subgraph Inspection["Concurrent Inspection (Goroutines)"]
-            CC["containerd Checker\n(In-process Go client)"]
-            FC["Linux Filesystem Checker\n(In-process Go scanner)"]
+            CC["containerd Checker\n(In-process Go client)"]:::checker
+            FC["Linux Filesystem Checker\n(In-process Go scanner)"]:::checker
         end
     end
 
     subgraph Host["Host Operating System"]
-        CD["containerd Runtime\n(Local Runtime Metadata)"]
-        PROC["Linux Mount Tables\n(/proc/*/mountinfo)"]
-        FS["OverlayFS Snapshots\n(/var/lib/containerd/...)"]
+        CD["containerd Runtime\n(Local Runtime Metadata)"]:::target
+        PROC["Linux Mount Tables\n(/proc/*/mountinfo)"]:::target
+        FS["OverlayFS Snapshots\n(/var/lib/containerd/...)"]:::target
     end
 
+    %% Interactions
     TUI -->|"Go function call"| HS
     HS -->|"Return scan results"| TUI
 
     HS -->|"goroutine"| CC
     HS -->|"goroutine"| FC
 
-    CC -->|"Return RuntimeInventory"| HS
-    FC -->|"Return HostInventory"| HS
+    CC -->|"RuntimeInventory"| HS
+    FC -->|"HostInventory"| HS
 
-    CC -->|"Inspect metadata"| CD
-    FC -->|"Read mount tables"| PROC
-    FC -->|"Scan snapshot directories"| FS
+    CC -.->|"Inspect metadata"| CD
+    FC -.->|"Read mount tables"| PROC
+    FC -.->|"Scan snapshot directories"| FS
+
+    style App fill:#161b22,stroke:#30363d,stroke-width:2px,color:#c9d1d9
+    style Host fill:#161b22,stroke:#30363d,stroke-width:2px,color:#c9d1d9
+    style Presentation fill:#0d1117,stroke:#21262d,stroke-width:1px,color:#c9d1d9
+    style Orchestration fill:#0d1117,stroke:#21262d,stroke-width:1px,color:#c9d1d9
+    style Inspection fill:#0d1117,stroke:#21262d,stroke-width:1px,color:#c9d1d9
 ```
 
 ---
@@ -49,11 +62,14 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
+    autonumber
+    actor User as User / Admin
     participant TUI as TUI (Client)
     participant HS as HunterService
     participant CC as containerd Checker
     participant FC as Linux Filesystem Checker
 
+    User->>TUI: Trigger Scan
     TUI->>HS: StartScan(ctx) [Method Call]
     par Concurrent In-Process Execution (goroutines)
         HS->>CC: Inspect(ctx)
@@ -64,6 +80,7 @@ sequenceDiagram
     end
     Note over HS: Reconcile, diff, and classify leaks
     HS-->>TUI: ScanReport [Return Value]
+    TUI-->>User: Render formatted leak table
 ```
 
 ---
