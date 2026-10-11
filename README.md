@@ -47,6 +47,7 @@ Because standard tools like `ctr` or `crictl` only check internal databases, the
 
 - [Problem Statement](docs/problem-statement.md) — Why resource leaks happen, how standard tools miss them, and how we define leak types.
 - [Scope and Requirements](docs/scope-and-requirements.md) — Supported environments, features, performance goals, and safety rules.
+- [Architecture & Design](docs/architecture.md) — Component responsibilities, request lifecycle, and orchestration flow.
 
 ---
 
