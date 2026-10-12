@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -368,7 +369,8 @@ func parseMountInfoLine(line string) (OverlayMountInfo, bool, error) {
 	return overlay, true, nil
 }
 
-// readSnapshotterMetadata reads containerd's overlayfs metadata.db in read-only mode.
+// readSnapshotterMetadata reads containerd's overlayfs metadata.db in read-only mode,
+// copying to a transient snapshot file to prevent advisory flock collisions with live containerd.
 func (c *Checker) readSnapshotterMetadata(ctx context.Context) (map[string]string, map[string]string, error) {
 	if c.metadataDBPath == "" {
 		return nil, nil, nil
@@ -377,9 +379,30 @@ func (c *Checker) readSnapshotterMetadata(ctx context.Context) (map[string]strin
 		return nil, nil, nil
 	}
 
-	db, err := bbolt.Open(c.metadataDBPath, 0600, &bbolt.Options{
+	srcFile, err := os.Open(c.metadataDBPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer srcFile.Close()
+
+	tmpFile, err := os.CreateTemp("", "container-hunter-meta-*.db")
+	if err != nil {
+		return nil, nil, err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		_ = tmpFile.Close()
+		return nil, nil, err
+	}
+	_ = tmpFile.Close()
+
+	db, err := bbolt.Open(tmpPath, 0600, &bbolt.Options{
 		ReadOnly: true,
-		Timeout:  1 * time.Second,
+		Timeout:  200 * time.Millisecond,
 	})
 	if err != nil {
 		return nil, nil, err
