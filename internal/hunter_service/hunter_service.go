@@ -161,13 +161,35 @@ func (s *Service) reconcile(startTime time.Time, rInv *containerdchecker.Runtime
 
 	// 1. Check every snapshot folder physically present on disk
 	for snapID, diskSnap := range hInv.SnapshotDirs {
-		_, knownInRuntime := rInv.KnownSnapshotIDs[snapID]
+		// Resolve metadata key from metadata.db if mapped, or direct ID
+		runtimeKey := snapID
+		if mappedKey, ok := hInv.DirIDToSnapshotKey[snapID]; ok && mappedKey != "" {
+			runtimeKey = mappedKey
+		}
+
+		_, knownInRuntime := rInv.KnownSnapshotIDs[runtimeKey]
+		if !knownInRuntime {
+			_, knownInRuntime = rInv.KnownSnapshotIDs[snapID]
+		}
+
 		activeMounts := mountsBySnapID[snapID]
-		hasLease := activeLeases[snapID]
-		hasContainer := activeContainers[snapID]
+		hasLease := activeLeases[runtimeKey] || activeLeases[snapID]
+
+		// Check container association (direct container name, or task mount rootfs)
+		hasContainer := activeContainers[runtimeKey] || activeContainers[snapID]
+		if !hasContainer && hInv.ActiveContainerMounts != nil {
+			for _, cID := range hInv.ActiveContainerMounts[snapID] {
+				if activeContainers[cID] {
+					hasContainer = true
+					break
+				}
+			}
+		}
+
 		age := now.Sub(diskSnap.ModTime)
 
-		if !knownInRuntime {
+		// A snapshot is legitimate if known in runtime OR attached to an active container
+		if !knownInRuntime && !hasContainer {
 			anomaly := DetectedAnomaly{
 				SnapshotID:   snapID,
 				Path:         diskSnap.Path,
@@ -180,8 +202,8 @@ func (s *Service) reconcile(startTime time.Time, rInv *containerdchecker.Runtime
 				HasContainer: hasContainer,
 			}
 
-			if hasLease || hasContainer || age < s.gracePeriod {
-				// Recently created or holds an active lease/container lock
+			if hasLease || age < s.gracePeriod {
+				// Recently created or holds an active lease
 				anomaly.Category = CategorySuspectedOrphan
 				anomaly.Reason = fmt.Sprintf("Directory exists on disk but is absent from containerd snapshot database (Age: %s, GracePeriod: %s)", age.Round(time.Second), s.gracePeriod)
 			} else if len(activeMounts) > 0 {
@@ -201,10 +223,18 @@ func (s *Service) reconcile(startTime time.Time, rInv *containerdchecker.Runtime
 	}
 
 	// 2. Check for "phantom" snapshots: present in containerd metadata but missing on disk
-	for snapID, meta := range rInv.KnownSnapshotIDs {
-		if _, existsOnDisk := hInv.SnapshotDirs[snapID]; !existsOnDisk {
+	for snapKey, meta := range rInv.KnownSnapshotIDs {
+		expectedDirID := snapKey
+		if mappedDir, ok := hInv.SnapshotKeyToDirID[snapKey]; ok && mappedDir != "" {
+			expectedDirID = mappedDir
+		}
+
+		_, existsDirect := hInv.SnapshotDirs[snapKey]
+		_, existsMapped := hInv.SnapshotDirs[expectedDirID]
+
+		if !existsDirect && !existsMapped {
 			report.Anomalies = append(report.Anomalies, DetectedAnomaly{
-				SnapshotID: snapID,
+				SnapshotID: snapKey,
 				Path:       "",
 				Category:   CategoryConfirmedInconsistency,
 				CheckedAt:  now,
@@ -229,7 +259,6 @@ func extractSnapshotIDsFromMount(m fschecker.OverlayMountInfo) []string {
 	}
 
 	for _, dir := range allDirs {
-		// Look for "/snapshots/<id>/" or ".../snapshots/<id>"
 		parts := strings.Split(dir, "/")
 		for i, part := range parts {
 			if part == "snapshots" && i+1 < len(parts) {

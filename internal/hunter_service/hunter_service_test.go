@@ -71,6 +71,53 @@ func TestHunterService_AllHealthy(t *testing.T) {
 	}
 }
 
+func TestHunterService_WithMappedSnapshotKeyAndActiveContainer(t *testing.T) {
+	now := time.Now().Add(-1 * time.Hour)
+	cMock := &mockContainerdInspector{
+		inv: &containerdchecker.RuntimeInventory{
+			KnownSnapshotIDs: map[string]containerdchecker.SnapshotInfo{
+				"sha256:alpine-layer": {Name: "sha256:alpine-layer", Kind: "Committed", Namespace: "default"},
+				"container-task-1":    {Name: "container-task-1", Kind: "Active", Namespace: "default"},
+			},
+			ActiveContainerIDs: []string{"container-task-1"},
+		},
+	}
+	fMock := &mockFilesystemInspector{
+		inv: &fschecker.HostInventory{
+			SnapshotDirs: map[string]fschecker.DiskSnapshotInfo{
+				"1": {ID: "1", Path: "/snapshots/1", SizeBytes: 8000000, InodeCount: 500, ModTime: now},
+				"2": {ID: "2", Path: "/snapshots/2", SizeBytes: 100, InodeCount: 4, ModTime: now},
+			},
+			DirIDToSnapshotKey: map[string]string{
+				"1": "sha256:alpine-layer",
+				"2": "container-task-1",
+			},
+			SnapshotKeyToDirID: map[string]string{
+				"sha256:alpine-layer": "1",
+				"container-task-1":    "2",
+			},
+			ActiveContainerMounts: map[string][]string{
+				"1": {"container-task-1"},
+				"2": {"container-task-1"},
+			},
+		},
+	}
+
+	service := NewService(cMock, fMock)
+	report, err := service.StartScan(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Because 1 and 2 map to runtime keys and active container, there should be ZERO anomalies!
+	if len(report.Anomalies) != 0 {
+		t.Errorf("expected 0 anomalies with resolved metadata keys, got %d: %+v", len(report.Anomalies), report.Anomalies)
+	}
+	if report.WastedDiskSpaceBytes != 0 {
+		t.Errorf("expected 0 wasted space, got %d", report.WastedDiskSpaceBytes)
+	}
+}
+
 func TestHunterService_ProvenResourceLeak(t *testing.T) {
 	oldTime := time.Now().Add(-10 * time.Minute)
 	cMock := &mockContainerdInspector{

@@ -3,6 +3,7 @@ package fschecker
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 const (
@@ -19,6 +22,9 @@ const (
 
 	// DefaultMountinfoPath is the standard Linux procfs mountinfo path for the current process.
 	DefaultMountinfoPath = "/proc/self/mountinfo"
+
+	// DefaultMetadataDBPath is the path to containerd overlayfs metadata bbolt database.
+	DefaultMetadataDBPath = "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/metadata.db"
 )
 
 // FilesystemInspector defines the interface for collecting host filesystem and mount table inventory.
@@ -55,16 +61,20 @@ type OverlayMountInfo struct {
 
 // HostInventory aggregates physical snapshot folders and active Linux OverlayFS mounts.
 type HostInventory struct {
-	SnapshotDirs        map[string]DiskSnapshotInfo `json:"snapshot_dirs"`
-	OverlayMounts       []OverlayMountInfo          `json:"overlay_mounts"`
-	TotalDiskUsageBytes int64                       `json:"total_disk_usage_bytes"`
-	TotalInodes         int64                       `json:"total_inodes"`
+	SnapshotDirs          map[string]DiskSnapshotInfo `json:"snapshot_dirs"`
+	OverlayMounts         []OverlayMountInfo          `json:"overlay_mounts"`
+	DirIDToSnapshotKey    map[string]string           `json:"dir_id_to_snapshot_key"`
+	SnapshotKeyToDirID    map[string]string           `json:"snapshot_key_to_dir_id"`
+	ActiveContainerMounts map[string][]string         `json:"active_container_mounts"`
+	TotalDiskUsageBytes   int64                       `json:"total_disk_usage_bytes"`
+	TotalInodes           int64                       `json:"total_inodes"`
 }
 
 // Checker performs read-only inspection of host snapshot directories and kernel mount tables.
 type Checker struct {
 	snapshotsRootDir string
 	mountinfoPath    string
+	metadataDBPath   string
 	calculateSizes   bool
 }
 
@@ -78,11 +88,19 @@ func WithCalculateSizes(enabled bool) Option {
 	}
 }
 
+// WithMetadataDBPath sets a custom path for containerd snapshotter metadata.db.
+func WithMetadataDBPath(path string) Option {
+	return func(c *Checker) {
+		c.metadataDBPath = path
+	}
+}
+
 // NewChecker creates a Checker instance with explicit snapshot directory and mountinfo paths.
 func NewChecker(snapshotsRootDir, mountinfoPath string, opts ...Option) *Checker {
 	c := &Checker{
 		snapshotsRootDir: snapshotsRootDir,
 		mountinfoPath:    mountinfoPath,
+		metadataDBPath:   filepath.Join(filepath.Dir(snapshotsRootDir), "metadata.db"),
 		calculateSizes:   true,
 	}
 	for _, opt := range opts {
@@ -96,15 +114,18 @@ func DefaultChecker(opts ...Option) *Checker {
 	return NewChecker(DefaultSnapshotsDir, DefaultMountinfoPath, opts...)
 }
 
-// Inspect collects snapshot directory metadata and active OverlayFS mounts across the host system.
+// Inspect collects snapshot directory metadata, mount tables, and metadata.db mappings.
 func (c *Checker) Inspect(ctx context.Context) (*HostInventory, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	inventory := &HostInventory{
-		SnapshotDirs:  make(map[string]DiskSnapshotInfo),
-		OverlayMounts: make([]OverlayMountInfo, 0),
+		SnapshotDirs:          make(map[string]DiskSnapshotInfo),
+		OverlayMounts:         make([]OverlayMountInfo, 0),
+		DirIDToSnapshotKey:    make(map[string]string),
+		SnapshotKeyToDirID:    make(map[string]string),
+		ActiveContainerMounts: make(map[string][]string),
 	}
 
 	// 1. Scan physical snapshot directories on disk
@@ -125,6 +146,25 @@ func (c *Checker) Inspect(ctx context.Context) (*HostInventory, error) {
 	}
 	if mounts != nil {
 		inventory.OverlayMounts = mounts
+		// Associate active container task mounts with referenced snapshot directory IDs
+		for _, m := range mounts {
+			containerID := extractContainerFromMountPoint(m.MountPoint)
+			if containerID != "" {
+				referencedIDs := extractSnapshotIDsFromMount(m)
+				for _, snapID := range referencedIDs {
+					inventory.ActiveContainerMounts[snapID] = append(inventory.ActiveContainerMounts[snapID], containerID)
+				}
+			}
+		}
+	}
+
+	// 3. Inspect containerd overlayfs metadata.db for directory-to-key mappings
+	dirToKey, keyToDir, _ := c.readSnapshotterMetadata(ctx)
+	if dirToKey != nil {
+		inventory.DirIDToSnapshotKey = dirToKey
+	}
+	if keyToDir != nil {
+		inventory.SnapshotKeyToDirID = keyToDir
 	}
 
 	return inventory, nil
@@ -252,9 +292,6 @@ func (c *Checker) parseMountInfo(ctx context.Context) ([]OverlayMountInfo, error
 }
 
 // parseMountInfoLine parses a single line of Linux mountinfo.
-// Format:
-// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
-// (1)(2) (3)   (4)    (5)      (6)      (7)   (8) (9)   (10)         (11)
 func parseMountInfoLine(line string) (OverlayMountInfo, bool, error) {
 	fields := strings.Fields(line)
 	if len(fields) < 7 {
@@ -329,6 +366,118 @@ func parseMountInfoLine(line string) (OverlayMountInfo, bool, error) {
 	}
 
 	return overlay, true, nil
+}
+
+// readSnapshotterMetadata reads containerd's overlayfs metadata.db in read-only mode.
+func (c *Checker) readSnapshotterMetadata(ctx context.Context) (map[string]string, map[string]string, error) {
+	if c.metadataDBPath == "" {
+		return nil, nil, nil
+	}
+	if _, err := os.Stat(c.metadataDBPath); os.IsNotExist(err) {
+		return nil, nil, nil
+	}
+
+	db, err := bbolt.Open(c.metadataDBPath, 0600, &bbolt.Options{
+		ReadOnly: true,
+		Timeout:  1 * time.Second,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer db.Close()
+
+	dirToKey := make(map[string]string)
+	keyToDir := make(map[string]string)
+
+	err = db.View(func(tx *bbolt.Tx) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		v1 := tx.Bucket([]byte("v1"))
+		if v1 == nil {
+			return nil
+		}
+		snaps := v1.Bucket([]byte("snapshots"))
+		if snaps == nil {
+			return nil
+		}
+		return snaps.ForEach(func(k, v []byte) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			b := snaps.Bucket(k)
+			if b == nil {
+				return nil
+			}
+			idBytes := b.Get([]byte("id"))
+			if len(idBytes) == 0 {
+				return nil
+			}
+			u64, _ := binary.Uvarint(idBytes)
+			dirID := strconv.FormatUint(u64, 10)
+
+			// Bucket key format: "<namespace>/<index>/<snapshot_key>"
+			keyStr := string(k)
+			parts := strings.SplitN(keyStr, "/", 3)
+			var snapKey string
+			if len(parts) == 3 {
+				snapKey = parts[2]
+			} else {
+				snapKey = keyStr
+			}
+
+			dirToKey[dirID] = snapKey
+			keyToDir[snapKey] = dirID
+			return nil
+		})
+	})
+
+	return dirToKey, keyToDir, err
+}
+
+// extractContainerFromMountPoint returns the container ID if mount is an active containerd task rootfs.
+func extractContainerFromMountPoint(mountPoint string) string {
+	const marker = "/io.containerd.runtime.v2.task/"
+	idx := strings.Index(mountPoint, marker)
+	if idx == -1 {
+		return ""
+	}
+	rem := mountPoint[idx+len(marker):]
+	parts := strings.Split(rem, "/")
+	if len(parts) >= 2 {
+		return parts[1] // namespace is parts[0], containerID is parts[1]
+	}
+	return ""
+}
+
+// extractSnapshotIDsFromMount extracts snapshot directory IDs referenced in an overlay mount.
+func extractSnapshotIDsFromMount(m OverlayMountInfo) []string {
+	idsMap := make(map[string]bool)
+	allDirs := append([]string{}, m.LowerDirs...)
+	if m.UpperDir != "" {
+		allDirs = append(allDirs, m.UpperDir)
+	}
+	if m.WorkDir != "" {
+		allDirs = append(allDirs, m.WorkDir)
+	}
+
+	for _, dir := range allDirs {
+		parts := strings.Split(dir, "/")
+		for i, part := range parts {
+			if part == "snapshots" && i+1 < len(parts) {
+				id := parts[i+1]
+				if id != "" {
+					idsMap[id] = true
+				}
+			}
+		}
+	}
+
+	result := make([]string, 0, len(idsMap))
+	for id := range idsMap {
+		result = append(result, id)
+	}
+	return result
 }
 
 // decodeProcEscapes decodes standard octal escape sequences used in Linux /proc/mountinfo (e.g. \040 -> space).
